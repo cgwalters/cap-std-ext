@@ -21,10 +21,15 @@ jobs:
   build:
     name: "Build"
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rustver: [stable, "1.64.0", "1.63", "1.62", "1.61", "1.60", "1.59", "1.58"]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rustver }}
       - name: Cache Dependencies
         uses: Swatinem/rust-cache@v2
       - name: Compile (no features)
