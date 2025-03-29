@@ -8,20 +8,85 @@
 //!
 //! [`cap_std::fs::Dir`]: https://docs.rs/cap-std/latest/cap_std/fs/struct.Dir.html
 
+use cap_primitives::fs::FileType;
 use cap_std::fs::{Dir, File, Metadata};
 use cap_tempfile::cap_std;
+use cap_tempfile::cap_std::fs::DirEntry;
 use rustix::path::Arg;
+use std::cmp::Ordering;
 use std::ffi::OsStr;
 use std::io::Result;
 use std::io::{self, Write};
 use std::ops::Deref;
 use std::os::fd::OwnedFd;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(feature = "fs_utf8")]
 use cap_std::fs_utf8;
 #[cfg(feature = "fs_utf8")]
 use fs_utf8::camino::Utf8Path;
+
+/// A directory entry encountered when using the `walk` function.
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct WalkComponent<'a, 'b> {
+    /// The relative path to the entry. This will
+    /// include the filename of [`entry`].
+    pub path: &'a Path,
+    /// The file type.
+    pub ty: FileType,
+    /// The directory entry.
+    pub entry: &'b DirEntry,
+}
+
+/// Options controlling recursive traversal with `walk`.
+#[non_exhaustive]
+pub struct WalkConfiguration {
+    /// Do not cross devices.
+    pub noxdev: bool,
+
+    sorter: Option<Box<dyn Fn(&DirEntry, &DirEntry) -> Ordering + 'static>>,
+}
+
+impl std::fmt::Debug for WalkConfiguration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WalkConfiguration")
+            .field("noxdev", &self.noxdev)
+            .field("sorter", &self.sorter.as_ref().map(|_| true))
+            .finish()
+    }
+}
+
+impl Default for WalkConfiguration {
+    fn default() -> Self {
+        Self {
+            noxdev: false,
+            sorter: None,
+        }
+    }
+}
+
+impl WalkConfiguration {
+    /// Enable configuration to not traverse mount points
+    pub fn noxdev(mut self) -> Self {
+        self.noxdev = true;
+        self
+    }
+
+    /// Set a function for sorting directory entries.
+    pub fn sort_by<F>(mut self, cmp: F) -> Self
+    where
+        F: Fn(&DirEntry, &DirEntry) -> Ordering + 'static,
+    {
+        self.sorter = Some(Box::new(cmp));
+        self
+    }
+
+    /// Sort directory entries by file name.
+    pub fn sort_by_file_name(self) -> Self {
+        self.sort_by(|a, b| a.file_name().cmp(&b.file_name()))
+    }
+}
 
 /// Extension trait for [`cap_std::fs::Dir`].
 ///
@@ -141,6 +206,15 @@ pub trait CapStdExtDirExt {
     /// In some scenarios (such as an older kernel) this currently may not be possible
     /// to determine, and `None` will be returned in those cases.
     fn is_mountpoint(&self, path: impl AsRef<Path>) -> Result<Option<bool>>;
+
+    /// Recursively walk a directory. If the function returns [`std::ops::ControlFlow::Break`]
+    /// while inspecting a directory, traversal of that directory is skipped. If
+    /// [`std::ops::ControlFlow::Break`] is returned when inspecting a non-directory,
+    /// then all further entries in the directory are skipped.
+    fn walk<C, E>(&self, config: &WalkConfiguration, callback: C) -> std::result::Result<(), E>
+    where
+        C: FnMut(&WalkComponent) -> std::result::Result<std::ops::ControlFlow<()>, E>,
+        E: From<std::io::Error>;
 }
 
 #[cfg(feature = "fs_utf8")]
@@ -371,6 +445,107 @@ fn is_mountpoint_impl_statx(root: &Dir, path: &Path) -> Result<Option<bool>> {
     }
 }
 
+/// Open the target directory, but return Ok(None) if this would cross a mount point.
+#[cfg(any(target_os = "android", target_os = "linux"))]
+fn impl_open_dir_noxdev(
+    d: &Dir,
+    path: impl AsRef<std::path::Path>,
+) -> std::io::Result<Option<Dir>> {
+    use rustix::fs::{Mode, OFlags, ResolveFlags};
+    match openat2_with_retry(
+        d,
+        path,
+        OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW,
+        Mode::empty(),
+        ResolveFlags::NO_XDEV | ResolveFlags::BENEATH,
+    ) {
+        Ok(r) => Ok(Some(Dir::reopen_dir(&r)?)),
+        Err(e) if e == rustix::io::Errno::XDEV => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Implementation of a recursive directory walk
+fn walk_inner<C, E>(
+    d: &Dir,
+    path: &mut PathBuf,
+    callback: &mut C,
+    config: &WalkConfiguration,
+) -> std::result::Result<(), E>
+where
+    C: FnMut(&WalkComponent) -> std::result::Result<std::ops::ControlFlow<()>, E>,
+    E: From<std::io::Error>,
+{
+    // If the provided path is empty, then we're reading the
+    // entries from the directory itself instead of a subdirectory.
+    let entries = if path.as_os_str().len() == 0 {
+        d.entries()?
+    } else {
+        d.read_dir(&path)?
+    };
+    // If sorting is enabled, then read all entries now and sort them.
+    let entries: Box<dyn Iterator<Item = Result<DirEntry>>> =
+        if let Some(sorter) = config.sorter.as_ref() {
+            let mut entries = entries.collect::<Result<Vec<_>>>()?;
+            entries.sort_by(|a, b| sorter(a, b));
+            Box::new(entries.into_iter().map(Ok))
+        } else {
+            Box::new(entries.into_iter())
+        };
+    // Operate on each entry
+    for entry in entries {
+        let entry = entry?;
+        // Gather basic data
+        let ty = entry.file_type()?;
+        let is_dir = ty.is_dir();
+        let name = entry.file_name();
+        // The path provided to the user includes the current filename
+        path.push(&name);
+        let component = WalkComponent {
+            path: &path,
+            ty,
+            entry: &entry,
+        };
+        // Invoke the user callback
+        let flow = callback(&component)?;
+        // Did the callback tell us to stop iteration?
+        let is_break = matches!(flow, std::ops::ControlFlow::Break(()));
+        // Handle the non-directory case first.
+        if !is_dir {
+            path.pop();
+            // If we got a break, then we're completely done.
+            if is_break {
+                return Ok(());
+            } else {
+                // Otherwise, process the next entry.
+                continue;
+            }
+        } else if is_break {
+            // For break on a directory, we continue processing the next entry.
+            path.pop();
+            continue;
+        }
+        // We're operating on a directory, and the callback must have told
+        // us to continue.
+        debug_assert!(matches!(flow, std::ops::ControlFlow::Continue(())));
+        // Check if we were configured not to cross devices. This uses
+        // openat2() right now; we open and discard the directory, which
+        // is currently racy in the case of concurrent mutation. However,
+        // arbitrary concurrent mutation can cause other failures in general
+        // here too.
+        if config.noxdev {
+            if impl_open_dir_noxdev(d, &path)?.is_none() {
+                path.pop();
+                continue;
+            }
+        }
+        // Recurse into the target directory
+        walk_inner(d, path, callback, config)?;
+        path.pop();
+    }
+    Ok(())
+}
+
 impl CapStdExtDirExt for Dir {
     fn open_optional(&self, path: impl AsRef<Path>) -> Result<Option<File>> {
         map_optional(self.open(path.as_ref()))
@@ -388,18 +563,7 @@ impl CapStdExtDirExt for Dir {
     /// Open the target directory, but return Ok(None) if this would cross a mount point.
     #[cfg(any(target_os = "android", target_os = "linux"))]
     fn open_dir_noxdev(&self, path: impl AsRef<std::path::Path>) -> std::io::Result<Option<Dir>> {
-        use rustix::fs::{Mode, OFlags, ResolveFlags};
-        match openat2_with_retry(
-            self,
-            path,
-            OFlags::CLOEXEC | OFlags::DIRECTORY | OFlags::NOFOLLOW,
-            Mode::empty(),
-            ResolveFlags::NO_XDEV | ResolveFlags::BENEATH,
-        ) {
-            Ok(r) => Ok(Some(Dir::reopen_dir(&r)?)),
-            Err(e) if e == rustix::io::Errno::XDEV => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        impl_open_dir_noxdev(self, path)
     }
 
     fn ensure_dir_with(
@@ -556,6 +720,15 @@ impl CapStdExtDirExt for Dir {
 
     fn is_mountpoint(&self, path: impl AsRef<Path>) -> Result<Option<bool>> {
         is_mountpoint_impl_statx(self, path.as_ref()).map_err(Into::into)
+    }
+
+    fn walk<C, E>(&self, config: &WalkConfiguration, mut callback: C) -> std::result::Result<(), E>
+    where
+        C: FnMut(&WalkComponent) -> std::result::Result<std::ops::ControlFlow<()>, E>,
+        E: From<std::io::Error>,
+    {
+        let mut pb = PathBuf::new();
+        walk_inner(self, &mut pb, &mut callback, config)
     }
 }
 

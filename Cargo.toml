@@ -20,6 +20,7 @@ libc = "0.2"
 
 [dev-dependencies]
 anyhow = "1.0"
+rand = "0.9"
 uuid = "1.10"
 
 [features]

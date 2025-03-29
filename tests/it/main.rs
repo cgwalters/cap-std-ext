@@ -2,10 +2,14 @@ use anyhow::Result;
 
 use cap_std::fs::{Dir, File, Permissions, PermissionsExt};
 use cap_std_ext::cmdext::CapStdExtCommandExt;
-use cap_std_ext::dirext::CapStdExtDirExt;
+use cap_std_ext::dirext::{CapStdExtDirExt, WalkConfiguration};
 use cap_std_ext::{cap_std, RootDir};
+use rustix::path::DecInt;
+use std::cmp::Ordering;
+use std::ffi::OsStr;
 use std::io::Write;
-use std::path::Path;
+use std::ops::ControlFlow;
+use std::path::{Path, PathBuf};
 use std::{process::Command, sync::Arc};
 
 #[test]
@@ -411,5 +415,146 @@ fn test_open_noxdev() -> Result<()> {
     assert!(usr.open_dir_noxdev("bin").unwrap().is_some());
     // Requires a mounted /proc, but that also seems ane.
     assert!(root.open_dir_noxdev("proc").unwrap().is_none());
+    Ok(())
+}
+
+#[test]
+fn test_walk() -> std::io::Result<()> {
+    let td = cap_tempfile::TempDir::new(cap_std::ambient_authority())?;
+
+    td.create_dir_all("usr/bin")?;
+    td.create_dir_all("usr/lib/foo")?;
+    td.create_dir_all("usr/share")?;
+    td.create_dir_all("etc")?;
+    td.write("usr/bin/bash", b"bash")?;
+    td.write("usr/bin/true", b"true")?;
+    td.write("usr/lib/foo/libfoo.so", b"libfoo")?;
+    td.write("usr/lib/libbar.so", b"libbar")?;
+    // Broken link
+    td.symlink("usr/share/timezone", "usr/share/EST")?;
+    // Symlink to self
+    td.symlink(".", "usr/bin/selflink")?;
+    td.write("etc/foo.conf", b"fooconf")?;
+    td.write("etc/blah.conf", b"blahconf")?;
+
+    // A successful walk, but skipping /etc
+    {
+        let mut n_dirs = 0;
+        let mut n_symlinks = 0;
+        let mut n_regfiles = 0;
+        td.walk::<_, std::io::Error>(&WalkConfiguration::default(), |e| {
+            if e.path.strip_prefix("usr/lib").is_ok() {
+                return Ok(ControlFlow::Break(()));
+            }
+            if e.ty.is_dir() {
+                n_dirs += 1;
+            } else if e.ty.is_symlink() {
+                n_symlinks += 1;
+            } else if e.ty.is_file() {
+                n_regfiles += 1;
+                // Verify we can open
+                let _ = e.entry.open().unwrap();
+            } else {
+                unreachable!();
+            }
+            Ok(ControlFlow::Continue(()))
+        })
+        .unwrap();
+        assert_eq!(n_dirs, 4);
+        assert_eq!(n_symlinks, 2);
+        assert_eq!(n_regfiles, 4);
+    }
+
+    // An error case
+    {
+        let r: std::io::Result<_> = td.walk(&WalkConfiguration::default(), |e| {
+            if e.path.strip_prefix("usr/share").is_ok() {
+                return Err(std::io::Error::other("oops"));
+            }
+            return Ok(ControlFlow::Continue(()));
+        });
+        match r {
+            Err(e) if e.kind() == std::io::ErrorKind::Other => {}
+            _ => unreachable!(),
+        }
+    };
+
+    Ok(())
+}
+
+#[test]
+fn test_walk_sorted() -> Result<()> {
+    let td = cap_tempfile::TempDir::new(cap_std::ambient_authority())?;
+
+    for _ in 0..5 {
+        let d = rand::random_range(0..1000);
+        let d = format!("dir{d}");
+        if td.try_exists(&d)? {
+            continue;
+        }
+        td.create_dir(&d)?;
+        for _ in 0..25 {
+            let j = rand::random_range(0..10);
+            let path = format!("{d}/{j}");
+            td.write(&path, DecInt::new(j).as_bytes())?;
+        }
+    }
+
+    // A successful walk in sorted order
+    {
+        let mut depth = 0;
+        let mut previous: Option<PathBuf> = None;
+        td.walk(
+            &WalkConfiguration::default().sort_by_file_name(),
+            |e| -> std::io::Result<_> {
+                let curdepth = e.path.components().count();
+                if curdepth != depth {
+                    depth = curdepth;
+                    previous = None;
+                } else if let Some(previous) = previous.as_deref() {
+                    assert_eq!(previous.cmp(e.path), Ordering::Less);
+                } else {
+                    previous = Some(e.path.to_owned());
+                }
+                Ok(ControlFlow::Continue(()))
+            },
+        )
+        .unwrap();
+    }
+
+    Ok(())
+}
+
+#[test]
+fn test_walk_noxdev() -> Result<()> {
+    let rootfs = Dir::open_ambient_dir("/", cap_std::ambient_authority())?;
+
+    let n_root_entries = std::fs::read_dir("/")?.count();
+    let mut i = 0;
+    rootfs
+        .walk(
+            &WalkConfiguration::default().noxdev(),
+            |e| -> std::io::Result<_> {
+                // Don't traverse, unless it's proc...except we shouldn't traverse that either because
+                // of noxdev.
+                let proc = "proc";
+                let first_component = e.path.components().next().unwrap();
+                let is_proc = first_component.as_os_str() == OsStr::new(proc);
+                let r = if e.ty.is_dir() {
+                    if is_proc {
+                        ControlFlow::Continue(())
+                    } else {
+                        ControlFlow::Break(())
+                    }
+                } else {
+                    ControlFlow::Continue(())
+                };
+                i += 1;
+                Ok(r)
+            },
+        )
+        .unwrap();
+    assert_eq!(n_root_entries, i);
+
     Ok(())
 }
